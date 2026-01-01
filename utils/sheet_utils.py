@@ -1,15 +1,17 @@
-from utils import sheets_constants
-from utils import discord_utils
-import constants
-import nextcord
-import gspread
-import database
-from sqlalchemy.sql.expression import insert
-from sqlalchemy.orm import Session
-from typing import Union
-import emoji
+from http import HTTPStatus
+from typing import Any, Union
 
+import emoji
+import gspread
+from gspread.exceptions import APIError
+import nextcord
 from nextcord.ext.commands import Context
+from sqlalchemy.orm import Session
+from sqlalchemy.sql.expression import insert
+
+import constants
+import database
+from utils import discord_utils, sheets_constants
 
 """
 Sheets utils. Useful for any commands that require Google Sheets.
@@ -414,16 +416,70 @@ async def sheetcreatetabgeneric(
             return
 
 
+# I'm sure there's a significantly cleaner way of doing this
+class CachingSpreadsheet(gspread.Spreadsheet):
+    def __init__(self, http_client: gspread.HTTPClient, properties: dict[str, Union[str, Any]]):
+        self.client = http_client
+        self._properties = properties
+
+        self.cached_metadata = self.fetch_sheet_metadata()
+        self._properties.update(self.cached_metadata["properties"])
+
+    def get_worksheet(self, index: int) -> gspread.Worksheet:
+        sheet_data = self.cached_metadata
+        try:
+            properties = sheet_data["sheets"][index]["properties"]
+            return gspread.Worksheet(self, properties, self.id, self.client)
+        except (KeyError, IndexError):
+            raise gspread.WorksheetNotFound("index {} not found".format(index))
+
+    def get_worksheet_by_id(self, id: str | int) -> gspread.Worksheet:
+        sheet_data = self.cached_metadata
+        try:
+            worksheet_id_int = int(id)
+        except ValueError as ex:
+            raise ValueError("id should be int") from ex
+
+        try:
+            item = gspread.utils.finditem(
+                lambda x: x["properties"]["sheetId"] == worksheet_id_int,
+                sheet_data["sheets"],
+            )
+            return gspread.Worksheet(self, item["properties"], self.id, self.client)
+        except (StopIteration, KeyError):
+            raise gspread.WorksheetNotFound("id {} not found".format(worksheet_id_int))
+
+class GspreadClientWithCachingSheet(gspread.Client):
+    def open_by_key(self, key: str) -> gspread.Spreadsheet:
+        try:
+            # It may actually be cleaner to monkeypatch in the class
+            spreadsheet = CachingSpreadsheet(self.http_client, {"id": key})
+        except APIError as ex:
+            if ex.response.status_code == HTTPStatus.NOT_FOUND:
+                raise gspread.SpreadsheetNotFound(ex.response) from ex
+            if ex.response.status_code == HTTPStatus.FORBIDDEN:
+                raise PermissionError from ex
+            raise ex
+        return spreadsheet
+
+
 class OverviewSheet:
     def __init__(self, gspread_client: gspread.Client, sheet_url: str):
         self.gspread_client = gspread_client
         self.sheet_url = sheet_url
         self.exception = None
 
+        # We cannot reduce this to one API call with the current structure.
+        # This is because we don't know the worksheet ID on sheet creation!
+
+        # This shaves off a read
+
+        # API call (GET /spreadsheets)
         self.spreadsheet = self.gspread_client.open_by_url(sheet_url)
         self.worksheet = self.spreadsheet.worksheet("Overview")
 
         # Cache all data on the overview sheet
+        # API call (GET /values)
         self.overview_data = self.worksheet.get()
 
     def get_cell_value(self, label: str) -> str:
